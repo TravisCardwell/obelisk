@@ -6,6 +6,7 @@
 {-# LANGUAGE TupleSections #-}
 module Obelisk.Command where
 
+import Control.Monad (forM, unless, void)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Data.Bool (bool)
 import Data.Foldable (for_)
@@ -350,6 +351,7 @@ main' argsCfg = do
     , "args=" <> show myArgs
     , "logging-level=" <> show logLevel
     ]
+  localeSet <- setLocaleC
 
   --TODO: We'd like to actually use the parser to determine whether to hand off,
   --but in the case where this implementation of 'ob' doesn't support all
@@ -360,7 +362,9 @@ main' argsCfg = do
         case _args_noHandOffPassed args' of
           False -> return ()
           True -> putLog Warning "--no-handoff should only be passed once and as the first argument; ignoring"
-        ob $ _args_command args'
+        if localeSet
+          then reExecuteOb obPath myArgs
+          else ob $ _args_command args'
       handoffAndGo as = findProjectObeliskCommand "." >>= \case
         Nothing -> go as -- If not in a project, just run ourselves
         Just impl -> do
@@ -453,3 +457,36 @@ resolveInterpretPaths ps = do
     -- | Merge two 'PathTree's preferring leaves on the right in as much as they overlap with paths on the left.
     mergeTrees :: PathTree a -> PathTree a -> PathTree a
     mergeTrees (PathTree_Node ax x) (PathTree_Node ay y) = PathTree_Node (ay <|> ax) $ Map.unionWith mergeTrees x y
+
+-- | Set locale environment variables to @C.UTF-8@
+--
+-- If the locale environment variables are not set to @C.UTF-8@ and
+-- @LOCALE_ARCHIVE@ is not set to a suitable path, then the program fails with
+-- an invalid character error when a non-ASCII character is printed.
+--
+-- This function checks locale environment variables and sets them to
+-- @C.UTF-8@ when necessary, returning 'True' if any were set.
+--
+-- When handing off, any changes are propagated.  With @--no-handoff@, the
+-- program must be re-executed (using 'reExecuteOb') in order for the new
+-- settings to take effect.  Note that care must be taken to not print any
+-- non-ASCII characters before handoff/re-execution.
+setLocaleC :: MonadObelisk m => m Bool
+setLocaleC = fmap or . forM envVars $ \envVar -> do
+  alreadySet <- liftIO $ (== Just locale) <$> lookupEnv envVar
+  unless alreadySet $ do
+    putLog Debug $ T.pack $ unwords ["Setting", envVar, "to", locale]
+    liftIO $ setEnv envVar locale
+  pure $ not alreadySet
+  where
+    envVars = ["LANG", "LC_CTYPE"]
+    locale  = "C.UTF-8"
+
+-- | Re-execute the program
+--
+-- This is done so that new locale environment variables take effect.  See
+-- 'setLocaleC' for details.
+reExecuteOb :: MonadObelisk m => FilePath -> [String] -> m ()
+reExecuteOb obPath myArgs = do
+  putLog Debug "Re-executing..."
+  void $ liftIO $ rawSystem obPath myArgs
